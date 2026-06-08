@@ -52,6 +52,14 @@ from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.utils import (
 from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.vision_model import Qwen3VLVisionModel
 
 
+def _miles_select_local_vision_embeds(embeds):
+    # Default no-op hook. Overridden (e.g. by miles) to select this CP rank's local
+    # vision embeddings from the full vision-tower output when the language input has
+    # been pre-sharded across context parallelism (the embeds are computed for the full
+    # sequence but the local combined_embeddings mask covers only this rank's tokens).
+    return embeds
+
+
 class Qwen3VLModel(MegatronModule):
     """Qwen3VL multi-modal model.
 
@@ -482,13 +490,13 @@ class Qwen3VLModel(MegatronModule):
                     vision_embeds = AllGatherVisionEmbeddings.apply(
                         vision_embeds,
                         seqlen_on_cp_ranks,
-                        cp_group=self.pg_collection.cp,
+                        self.pg_collection.cp,
                     )
                     for i in range(len(deepstack_feature_lists)):
                         deepstack_feature_lists[i] = AllGatherVisionEmbeddings.apply(
                             deepstack_feature_lists[i],
                             seqlen_on_cp_ranks,
-                            cp_group=self.pg_collection.cp,
+                            self.pg_collection.cp,
                         )
 
             combined_embeddings = self.language_model.embedding(
@@ -498,6 +506,7 @@ class Qwen3VLModel(MegatronModule):
 
             if vision_embeds is not None:
                 combined_embeddings = combined_embeddings.transpose(0, 1).contiguous()
+                vision_embeds = _miles_select_local_vision_embeds(vision_embeds)
                 combined_embeddings[vision_mask] = vision_embeds
                 combined_embeddings = combined_embeddings.transpose(0, 1).contiguous()
 
@@ -527,6 +536,7 @@ class Qwen3VLModel(MegatronModule):
                     tmp_embeddings = torch.zeros_like(combined_embeddings.transpose(0, 1))
                     new_deepstack_feature_lists = []
                     for deepstack_visual_embed in deepstack_feature_lists:
+                        deepstack_visual_embed = _miles_select_local_vision_embeds(deepstack_visual_embed)
                         tmp_embeddings[vision_mask] = deepstack_visual_embed
                         tmp_embeddings_thd = preprocess_packed_seqs(
                             tmp_embeddings.contiguous(),
