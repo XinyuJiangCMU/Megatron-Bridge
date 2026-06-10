@@ -364,8 +364,9 @@ class Qwen3VLModel(MegatronModule):
         if cu_list[0] != 0 or cu_list[-1] != cp_size * local_len:
             return None  # full-sequence input: nothing to select
         is_vis = (flat == self.image_token_id) | (flat == self.video_token_id)
-        if int(is_vis.sum()) == vision_embeds.shape[0]:
-            return None  # every vision token is local
+        # NOTE: every return between here and the all_gather must be identical across CP
+        # ranks (the decisions below only depend on cu_seqlens, which all ranks share);
+        # rank-dependent shortcuts may only happen after the collective.
         num_chunks = 2 * cp_size
         num_segments = len(cu_list) - 1
         counts_local = torch.zeros(num_segments, 2, dtype=torch.long, device=flat.device)
@@ -380,6 +381,8 @@ class Qwen3VLModel(MegatronModule):
         gathered = [torch.empty_like(counts_local) for _ in range(cp_size)]
         torch.distributed.all_gather(gathered, counts_local, group=cp_group)
         cp_rank = torch.distributed.get_rank(group=cp_group)
+        if int(counts_local.sum()) == vision_embeds.shape[0]:
+            return None  # every vision token is local on this rank; embeds already match
         # Re-order per-rank chunk counts into full chunk order (rank r owns chunks r and
         # 2*cp-1-r), then exclusive-prefix-sum to get each chunk's offset in the full
         # vision-token order (segment-major).
