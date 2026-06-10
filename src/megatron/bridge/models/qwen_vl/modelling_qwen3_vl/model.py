@@ -402,8 +402,7 @@ class Qwen3VLModel(MegatronModule):
                     start = int(offsets[i, chunk_id])
                     idx_parts.append(torch.arange(start, start + n, device=vision_embeds.device))
         if not idx_parts:
-            # Pre-sharded input with no local vision tokens: select zero rows (the local
-            # vision mask is empty). None strictly means "input is not pre-sharded".
+            # No local vision tokens: select zero rows (None means "not pre-sharded").
             return torch.zeros(0, dtype=torch.long, device=vision_embeds.device)
         return torch.cat(idx_parts)
 
