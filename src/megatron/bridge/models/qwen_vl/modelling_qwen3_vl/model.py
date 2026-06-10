@@ -52,12 +52,18 @@ from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.utils import (
 from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.vision_model import Qwen3VLVisionModel
 
 
-def _miles_select_local_vision_embeds(embeds):
-    # Default no-op hook. Overridden (e.g. by miles) to select this CP rank's local
-    # vision embeddings from the full vision-tower output when the language input has
-    # been pre-sharded across context parallelism (the embeds are computed for the full
-    # sequence but the local combined_embeddings mask covers only this rank's tokens).
-    return embeds
+def select_cp_local_vision_embeds(vision_embeds):
+    """Map full-sequence vision embeddings to the vision tokens present in the local input.
+
+    ``Qwen3VLModel.forward`` computes vision embeddings for every image in the batch and
+    scatters them into the vision-token positions of ``input_ids``. When a training
+    framework pre-shards ``input_ids`` across context-parallel ranks (instead of passing
+    the full sequence), the local vision mask only covers this rank's vision tokens, so
+    the embedding rows must be filtered to match. Such frameworks override this hook with
+    their layout-specific selection (see radixark/miles#1308 for the zigzag CP layout used
+    by miles). The default is the identity, which keeps the stock full-sequence behaviour.
+    """
+    return vision_embeds
 
 
 class Qwen3VLModel(MegatronModule):
@@ -506,7 +512,7 @@ class Qwen3VLModel(MegatronModule):
 
             if vision_embeds is not None:
                 combined_embeddings = combined_embeddings.transpose(0, 1).contiguous()
-                vision_embeds = _miles_select_local_vision_embeds(vision_embeds)
+                vision_embeds = select_cp_local_vision_embeds(vision_embeds)
                 combined_embeddings[vision_mask] = vision_embeds
                 combined_embeddings = combined_embeddings.transpose(0, 1).contiguous()
 
@@ -536,7 +542,7 @@ class Qwen3VLModel(MegatronModule):
                     tmp_embeddings = torch.zeros_like(combined_embeddings.transpose(0, 1))
                     new_deepstack_feature_lists = []
                     for deepstack_visual_embed in deepstack_feature_lists:
-                        deepstack_visual_embed = _miles_select_local_vision_embeds(deepstack_visual_embed)
+                        deepstack_visual_embed = select_cp_local_vision_embeds(deepstack_visual_embed)
                         tmp_embeddings[vision_mask] = deepstack_visual_embed
                         tmp_embeddings_thd = preprocess_packed_seqs(
                             tmp_embeddings.contiguous(),
