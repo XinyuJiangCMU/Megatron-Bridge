@@ -126,9 +126,8 @@ class Qwen3NextBridge(MegatronModelBridge):
             "mtp.layers.0.final_layernorm.weight": "mtp.norm.weight",
         }
 
-        # Megatron-LM renamed the MTP submodule `transformer_layer` -> `mtp_model_layer`.
-        # Register both spellings so the bridge works with either Megatron-LM version
-        # (same approach as glm45_bridge).
+        # Register both MTP submodule spellings (mtp_model_layer / transformer_layer),
+        # like glm45_bridge, so the bridge works with either Megatron-LM version.
         for mtp_layer_attr in ("mtp_model_layer", "transformer_layer"):
             param_mappings.update(
                 {
