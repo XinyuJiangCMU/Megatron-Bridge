@@ -52,20 +52,6 @@ from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.utils import (
 from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.vision_model import Qwen3VLVisionModel
 
 
-def select_cp_local_vision_embeds(vision_embeds):
-    """Map full-sequence vision embeddings to the vision tokens present in the local input.
-
-    ``Qwen3VLModel.forward`` computes vision embeddings for every image in the batch and
-    scatters them into the vision-token positions of ``input_ids``. When a training
-    framework pre-shards ``input_ids`` across context-parallel ranks (instead of passing
-    the full sequence), the local vision mask only covers this rank's vision tokens, so
-    the embedding rows must be filtered to match. Such frameworks override this hook with
-    their layout-specific selection (see radixark/miles#1308 for the zigzag CP layout used
-    by miles). The default is the identity, which keeps the stock full-sequence behaviour.
-    """
-    return vision_embeds
-
-
 class Qwen3VLModel(MegatronModule):
     """Qwen3VL multi-modal model.
 
@@ -344,6 +330,78 @@ class Qwen3VLModel(MegatronModule):
                 for param in self.vision_model.merger.parameters():
                     param.requires_grad = True
 
+    def _cp_local_vision_embed_indices(self, vision_embeds, input_ids, packed_seq_params):
+        """Row indices selecting this CP rank's vision tokens from full-sequence vision embeds.
+
+        ``forward`` computes vision embeddings for every image in the batch and scatters
+        them into the vision-token positions of ``input_ids``. When a training framework
+        pre-shards ``input_ids`` across context-parallel ranks (detected by
+        ``cu_seqlens_q[-1] == cp_size * len(input_ids)``), the local vision mask covers
+        only this rank's vision tokens, so the embedding rows must be filtered to match.
+
+        Assumes Megatron's load-balanced ("zigzag") context-parallel layout: every packed
+        segment of full length ``L`` (a multiple of ``2 * cp``) is split into ``2 * cp``
+        chunks and rank ``r`` holds chunks ``r`` and ``2 * cp - 1 - r``. Only per-chunk
+        vision-token counts are all-gathered (a few ints per segment), not the token ids.
+
+        Returns ``None`` when the input is not pre-sharded or no selection is needed
+        (stock full-sequence behaviour).
+        """
+        if vision_embeds is None or packed_seq_params is None:
+            return None
+        if getattr(packed_seq_params, "qkv_format", None) != "thd":
+            return None
+        cp_group = self.pg_collection.cp
+        cp_size = cp_group.size()
+        if cp_size <= 1:
+            return None
+        cu = packed_seq_params.cu_seqlens_q
+        if cu is None or cu.numel() < 2:
+            return None
+        flat = input_ids.reshape(-1)
+        local_len = flat.numel()
+        cu_list = cu.tolist()
+        if cu_list[0] != 0 or cu_list[-1] != cp_size * local_len:
+            return None  # full-sequence input: nothing to select
+        is_vis = (flat == self.image_token_id) | (flat == self.video_token_id)
+        if int(is_vis.sum()) == vision_embeds.shape[0]:
+            return None  # every vision token is local
+        num_chunks = 2 * cp_size
+        num_segments = len(cu_list) - 1
+        counts_local = torch.zeros(num_segments, 2, dtype=torch.long, device=flat.device)
+        for i in range(num_segments):
+            seg_full = cu_list[i + 1] - cu_list[i]
+            if seg_full % num_chunks != 0:
+                return None  # unknown sharding; keep stock behaviour
+            c = seg_full // num_chunks
+            local_off = cu_list[i] // cp_size
+            counts_local[i, 0] = is_vis[local_off : local_off + c].sum()
+            counts_local[i, 1] = is_vis[local_off + c : local_off + 2 * c].sum()
+        gathered = [torch.empty_like(counts_local) for _ in range(cp_size)]
+        torch.distributed.all_gather(gathered, counts_local, group=cp_group)
+        cp_rank = torch.distributed.get_rank(group=cp_group)
+        # Re-order per-rank chunk counts into full chunk order (rank r owns chunks r and
+        # 2*cp-1-r), then exclusive-prefix-sum to get each chunk's offset in the full
+        # vision-token order (segment-major).
+        full_counts = torch.zeros(num_segments, num_chunks, dtype=torch.long)
+        for r in range(cp_size):
+            g = gathered[r].cpu()
+            full_counts[:, r] = g[:, 0]
+            full_counts[:, num_chunks - 1 - r] = g[:, 1]
+        flat_counts = full_counts.reshape(-1)
+        offsets = (torch.cumsum(flat_counts, 0) - flat_counts).reshape(num_segments, num_chunks)
+        counts_cpu = counts_local.cpu()
+        idx_parts = []
+        for i in range(num_segments):
+            for j, chunk_id in enumerate((cp_rank, num_chunks - 1 - cp_rank)):
+                n = int(counts_cpu[i, j])
+                if n:
+                    start = int(offsets[i, chunk_id])
+                    idx_parts.append(torch.arange(start, start + n, device=vision_embeds.device))
+        if not idx_parts:
+            return None
+        return torch.cat(idx_parts)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -510,9 +568,14 @@ class Qwen3VLModel(MegatronModule):
                 position_ids=None,  # NOTE: disable
             ).clone()  # [text_seq_len, b, h_language]
 
+            cp_local_vision_idx = None
             if vision_embeds is not None:
                 combined_embeddings = combined_embeddings.transpose(0, 1).contiguous()
-                vision_embeds = select_cp_local_vision_embeds(vision_embeds)
+                cp_local_vision_idx = self._cp_local_vision_embed_indices(
+                    vision_embeds, input_ids, packed_seq_params
+                )
+                if cp_local_vision_idx is not None:
+                    vision_embeds = vision_embeds.index_select(0, cp_local_vision_idx)
                 combined_embeddings[vision_mask] = vision_embeds
                 combined_embeddings = combined_embeddings.transpose(0, 1).contiguous()
 
@@ -542,7 +605,8 @@ class Qwen3VLModel(MegatronModule):
                     tmp_embeddings = torch.zeros_like(combined_embeddings.transpose(0, 1))
                     new_deepstack_feature_lists = []
                     for deepstack_visual_embed in deepstack_feature_lists:
-                        deepstack_visual_embed = select_cp_local_vision_embeds(deepstack_visual_embed)
+                        if cp_local_vision_idx is not None:
+                            deepstack_visual_embed = deepstack_visual_embed.index_select(0, cp_local_vision_idx)
                         tmp_embeddings[vision_mask] = deepstack_visual_embed
                         tmp_embeddings_thd = preprocess_packed_seqs(
                             tmp_embeddings.contiguous(),
